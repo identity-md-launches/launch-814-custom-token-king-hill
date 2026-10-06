@@ -24,7 +24,8 @@ contract ReentrantKing {
     KingRouter immutable router;
     uint256 public reentries;
     uint256 public reentryFailures;
-    uint8 public mode; // 0: claim again, 1: swap during the payout, 2: dethrone during the payout
+    bytes4 public lastError;
+    uint8 public mode; // 0: claim, 1: buy, 2: dethrone, 3: sell during payout
 
     constructor(KingHook hook_) {
         hook = hook_;
@@ -56,9 +57,16 @@ contract ReentrantKing {
             catch {
                 reentryFailures++;
             }
-        } else {
+        } else if (mode == 2) {
             try hook.dethrone() {}
             catch {
+                reentryFailures++;
+            }
+        } else {
+            hook.token().approve(address(router), 1);
+            try router.sellExactIn(1, 0, block.timestamp) {}
+            catch (bytes memory reason) {
+                lastError = bytes4(reason);
                 reentryFailures++;
             }
         }
@@ -279,6 +287,17 @@ contract KingHookSecurityTest is KingBase {
         assertEq(hook.king(), address(k));
     }
 
+    function test_sellCheckpointDuringAPayoutIsRefused() public {
+        ReentrantKing k = setUpReentrantKing();
+        k.setMode(3);
+        uint256 held = token.balanceOf(address(k));
+        k.claim();
+        assertEq(k.reentryFailures(), 1);
+        assertEq(k.lastError(), IKingHook.PayoutInProgress.selector);
+        assertEq(token.balanceOf(address(k)), held);
+        assertEq(hook.king(), address(k));
+    }
+
     function test_hookCallbacksRefuseToRunDuringAPayout() public {
         // Direct check of the guard: pretend the manager calls back while the guard is set is not
         // possible from outside, so verify via the swap-during-payout path above and the claim path.
@@ -291,12 +310,16 @@ contract KingHookSecurityTest is KingBase {
 
     // ------------------------------------------------------------------ foreign routers
 
-    function test_hookDataFromAnotherRouterIsIgnored() public {
+    function test_foreignBuyerIdentityIsIgnoredAndMustTakeIsRejected() public {
         buyExactIn(carol, 10 ether, false);
         openGame();
+        expectHookRevert(
+            IHooks.afterSwap.selector,
+            abi.encodeWithSelector(IKingHook.ThroneNotTaken.selector, 1 ether, 0.01 ether, true)
+        );
         thirdPartySwap(alice, true, -1 ether, 1 ether, abi.encode(alice, true));
         assertEq(hook.king(), address(0), "a foreign router cannot name a king");
-        assertGt(token.balanceOf(alice), 0, "...and the flag does not revert its swap");
+        assertEq(token.balanceOf(alice), 0, "must-take reverts the swap");
         thirdPartySwap(alice, true, -1 ether, 1 ether, abi.encode(bob, false));
         assertEq(hook.king(), address(0));
     }

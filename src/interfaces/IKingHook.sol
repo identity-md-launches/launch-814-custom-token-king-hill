@@ -13,7 +13,7 @@ interface IKingHook {
         None, // reign still running
         Dethroned, // somebody paid the throne price
         Sold, // the king sold through the official router
-        Balance // the king's balance dropped below the required amount (dethrone() or a swap noticed)
+        Balance // the king's balance dropped below the requirement (claim, dethrone or a swap noticed)
     }
 
     /// @notice One reign, past or current.
@@ -22,9 +22,9 @@ interface IKingHook {
         uint64 start; // timestamp of the takeover
         uint64 end; // 0 while the reign is running
         uint256 paid; // ETH the king paid in the takeover buy, fee included
-        uint256 required; // KING the king must keep (the tokens that buy delivered)
+        uint256 required; // KING to keep; a self-retake also preserves the previous requirement
         uint256 earned; // ETH the king kept from the throne pool during this reign
-        uint256 forfeited; // ETH returned to the pool because the king ended a reign before it vested
+        uint256 forfeited; // provisional income returned, plus unverified income retained by the pool
         EndReason reason;
     }
 
@@ -75,7 +75,9 @@ interface IKingHook {
     error PayoutInProgress();
     error UnexpectedCallback();
     error PayoutMismatch();
+    error NotRouter();
 
+    function prepareSell(address seller) external;
     function poolKey() external view returns (PoolKey memory);
     function feeRate() external view returns (uint256);
     function gameOpen() external view returns (bool);

@@ -10,7 +10,7 @@ frontend lives in this repository.
 | Hook | `src/KingHook.sol` | Fee, throne pool, throne game, payouts, views |
 | Router | `src/KingRouter.sol` | Official swap router, deployed by the hook's constructor |
 | Views/ABI | `src/interfaces/IKingHook.sol` | Structs, events, errors and the read interface for a website |
-| Math | `src/libraries/Halving.sol` | Exact binary exponential decay used by the price and the income |
+| Math | `src/libraries/Halving.sol` | Fixed-point exponential decay used by the price and the income |
 | Flags | `src/HookFlags.sol` | v4 permission bits, address check and CREATE2 salt mining |
 | Manifest | `launch.json` | Factory manifest (`kind: univ4_hook`) |
 | Script | `script/Deploy.s.sol` | Reference deployment; its `deploy()` is exercised by tests |
@@ -74,7 +74,10 @@ and `take` ETH inside a PoolManager unlock the hook itself opens. Consequences:
 
 * The PoolManager's ETH balance always covers the hook's claims (invariant-tested).
 * A recipient that cannot receive ETH (a contract without `receive`) only breaks **its own**
-  `claim()`; it can never halt a swap or anybody else's claim. This holds for the team wallet too.
+  `claim()`; it cannot halt anybody else's swap or claim. This holds for the team wallet too.
+  A wallet using `buyExactOut` must also accept native ETH refunds from the PoolManager; otherwise
+  a surplus refund reverts its entire buy. `buyExactIn` needs no refund receiver. Sells likewise
+  require the selling wallet to accept their native ETH output.
 
 ### Partial fills
 
@@ -82,6 +85,11 @@ For the two cases charged in `beforeSwap` the fee is computed on the specified a
 could not fill that amount (price limit reached) the hook reverts with `PartialFill` rather than
 overcharge. With the launch liquidity reaching the minimum tick, an exact-input buy never partially
 fills; an exact-output sell larger than the pool's ETH reverts (tested).
+An exact-input KING sell can partially fill when the curve runs out of ETH. The router refunds
+`requested KING - actual KING consumed` to that seller and reports actual consumption in `Swapped`.
+Exact-output sells likewise refund only their own unused `maxKingIn`; they cannot sweep earlier
+balances or use them to exceed the caller's budget. Do not send tokens directly to the router:
+unsolicited deposits have no recovery function.
 
 ## The throne
 
@@ -95,25 +103,31 @@ fills; an exact-output sell larger than the pool's ETH reverts (tested).
   when it next halves, 0 at the floor.
 * **Income**: while there is a king the pool pays `2%` of itself per hour, compounded per second:
   `pool(t) = pool(t0) · 0.98^((t − t0)/3600)`, the difference credited to the king. It is
-  path-independent, so how often the accrual is booked changes nothing. `incomePerHour()` is 2% of
-  the current pool. The king claims any time, also after losing the throne.
+  path-independent up to fixed-point rounding. `incomePerHour()` is 2% of the current pool.
+  Vested income is claimable during and after a reign.
 * **Holding rule**: the king must keep at least the KING his takeover delivered
   (`requiredBalance`). Any sell by the king through `KingRouter` empties the throne at once,
   whatever the amount. Every swap also checks `balanceOf(king) >= requiredBalance` in `beforeSwap`,
-  and the permissionless `dethrone()` does the same; both stop the income at that moment. Sells by
-  anyone else never touch the throne.
+  `claim()` and permissionless `dethrone()` also check it **before** accrual or vesting. On a short
+  balance, provisional income and income since `lastAccrual` stay in the pool; already vested
+  credits remain claimable. Sells by anyone else never end a valid king's reign.
+  The router calls authenticated `prepareSell(msg.sender)` before pulling KING, so a valid king's
+  sell is recorded as `Sold`, including exact-output sells with temporary maximum-input escrow.
 * **Same king again**: a buy by the sitting king that meets the price is a new reign (new price
-  base, new required balance, new history entry).
+  base and history entry). Its holding requirement is `max(previous requirement, new buy's KING)`;
+  a self-retake cannot reduce it. The new reign starts a fresh five-minute vesting period.
 * **Must-take flag**: `KingRouter.buyExactIn/buyExactOut(..., mustTake = true, ...)` reverts the
   whole swap (no fee, no tokens, nothing) if the buy would not take the throne.
 
 ### Income vesting: the defence against throne farming
 
 See the analysis below. The income earned in the first **5 minutes** of a reign vests only when
-the reign is 5 minutes old (then everything vests at once and the king is paid per second as
-usual) or when **somebody else** dethrones him by a takeover. A king who ends his own reign
-earlier, by selling or by letting his balance drop below the requirement, forfeits that income
-back to the pool (`Reign.forfeited`, event `IncomeForfeited`). `unclaimedIncome(king)` shows what
+the reign is 5 minutes old and the holding check succeeds. **Every** earlier end forfeits the
+income, including self-retakes and rival takeovers; cooperating wallets cannot accelerate vesting.
+An honest king outbid before five minutes also forfeits it (less than about 0.169% of the starting
+pool without intervening fees). Balance failures forfeit all provisional income plus the unverified
+interval since `lastAccrual`, regardless of how long the reign lasted (`Reign.forfeited`, event
+`IncomeForfeited`). That interval is retained in the pool without first crediting it to the king. `unclaimedIncome(king)` shows what
 is claimable now; `kingVestingIncome()` shows what is earned but not yet claimable; `throne()`
 carries both and `vestsAt`.
 
@@ -130,14 +144,26 @@ user. The options and their trade-offs:
 | **hookData from a router the hook owns** (chosen) | The hook deploys `KingRouter` in its constructor and trusts hookData only when `sender == router`. The router writes `msg.sender` into hookData and always delivers the output to `msg.sender`, so the buyer named is the wallet that holds the tokens, which the holding rule needs. |
 
 Swaps through any other router (Uniswap app, aggregators) pay the fee like everyone else but
-cannot take the throne, and hookData they carry is ignored (tested). The website should route
-through `hook.router()`.
+cannot take the throne. Canonical 64-byte `abi.encode(buyer, true)` hookData from such a router
+reverts with `ThroneNotTaken`, even above the price: the flag never silently charges a fee for a
+throne the router cannot take. Foreign buyer identity and unrelated metadata are ignored.
+The website should route through `hook.router()`.
 
 A sell by the king through a third-party router cannot be attributed during that swap, because such
 routers pull the tokens **after** the hook ran. The balance check catches it at the next swap by
-anyone or at a `dethrone()` call, and the throne price is recomputed after that dethrone inside
+anyone, `claim()`, or `dethrone()`. The throne price is recomputed after that dethrone inside
 the same swap, so the next buyer takes an empty throne at the floor. Through `KingRouter` the
-dethrone is immediate.
+dethrone is immediate. Detection forfeits the unverified interval, rather than paying a non-holder
+through the quiet period. A claim that detects a short balance succeeds with zero payout if it
+has nothing else to pay, so the dethrone persists; an ordinary empty claim still reverts.
+
+A plain ERC-20 exposes no historical balance at the time tokens left. An honest holder should
+claim vested income before transferring below the requirement; otherwise income since the last
+successful checkpoint is lost. Exits followed by restoring the balance between observations
+cannot be detected, and foreign-router sells of surplus cannot be attributed. Enforcing every
+sell through arbitrary routers immediately would require restricting routers or changing the
+plain-token design. These limits remain explicit; `dethrone()` and monitoring provide observation,
+not proof of continuous historical holding.
 
 ## Bot farming: what we saw and what defends against it
 
@@ -145,22 +171,26 @@ dethrone is immediate.
   income of one 2-second Base block is `pool · 2% · 2 / 3600`; the round trip costs two fees (about
   5% of 0.01 ETH). It is profitable only for a pool above ~45 ETH on Base (~7.5 ETH on a 12-second
   chain) and would keep the throne permanently occupied by a bot at the floor. **Defence**: the
-  5-minute income vesting above. A bot that exits by itself inside 5 minutes earns nothing, and a
-  bot that holds 5 minutes is a player like any other, exposed to the 1.2× outbid rule.
+  5-minute income vesting above. No reign ending inside five minutes earns income, including
+  self-retakes and two-wallet relays. This imposes a minimum exposure period, not a guarantee
+  against profitable farming: five uncontested minutes earn about 0.1682% of the pool, while a
+  0.01 ETH round trip costs roughly 0.00055 ETH in hook/LP fees before gas and price impact.
+  A pool of roughly 0.33 ETH can already make that strategy profitable.
 * **Sandwiching / front-running a takeover.** On a public mempool a bot can front-run a takeover
   with a slightly larger buy. The victim then either buys tokens without the throne or, with the
   **must-take flag**, reverts and pays no fee. The front-runner now holds the throne at 1.2× what it
-  paid, so it cannot squat for free. On Base there is no public mempool (the sequencer orders by
-  arrival, with Flashblocks pre-confirmations), so this needs sequencer-side insight.
+  paid. Sequencer ordering, private order flow and latency advantages remain risks on Base;
+  the hook makes no fairness guarantee about transaction inclusion or ordering.
 * **Sequencer ordering / latency races.** After a vacancy the price is the floor by specification,
   so the first buy to reach the sequencer wins it; a latency bot will usually win that race. The
-  win is cheap, not valuable: the next player takes it for 1.2 × 0.01 ETH and the bot's income
-  of a few seconds is below the vesting threshold. Competition is in ETH size, not latency.
-* **Block stuffing.** Nothing in the game is settled per block or at a deadline; price and income
-  are continuous in `block.timestamp`, so stuffing buys nothing. Sequencer timestamp drift is a
-  few seconds and affects income by `2% · drift / 3600`.
-* **Flash loans.** A takeover must be held across time to earn and a sell dethrones at once;
-  inside one transaction no income exists.
+  next player can take it for 1.2 × 0.01 ETH and income from a few seconds is forfeited. A bot
+  that remains uncontested for five minutes can still profit; latency and capital both matter.
+* **Block stuffing / censorship.** Price and income use `block.timestamp`, avoiding per-block
+  rewards, but suppressing rival transactions for five minutes can still protect a profitable
+  reign. Timestamp changes also affect vesting. The hook cannot prevent sequencer censorship.
+* **Flash loans.** A new reign earns no income within its creation transaction. An existing
+  reign's holdings are checked only at observations; temporary balance restoration remains a
+  limitation of using a plain ERC-20.
 * **Self-dethrone to reset the price.** Only hurts the king who does it: the throne empties and
   anyone may take it at the floor.
 
@@ -231,11 +261,12 @@ unspecified ETH amount. Transient storage is OpenZeppelin's `ReentrancyGuardTran
   it must accept plain ETH transfers.
 * **Website** should use `hook.router()` for buys and sells (`buyExactIn`, `buyExactOut`,
   `sellExactIn`, `sellExactOut`, all with slippage and deadline parameters) so that takeovers and
-  the must-take flag work, and should warn that a sell through any other venue drops the throne at
-  the next interaction.
+  the must-take flag work, and should warn that a sell through another venue which leaves the king
+  below the requirement drops the throne at the next observation, forfeiting unverified income.
+  Foreign-router surplus sells cannot be identified.
 * **Monitoring**: `ThroneTaken`, `ThroneVacated`, `IncomeVested`, `IncomeForfeited`, `Claimed`,
   `FeeCollected`. Anyone may call `dethrone()` when the king's balance falls short; a keeper is
-  optional because every swap does the same check.
+  optional because every swap and claim does the same check.
 * **Explorer verification** (`forge verify-contract`) is the deployer's step; verify the token, the
   hook and `hook.router()`.
 
@@ -259,14 +290,19 @@ forge fmt --check
   partial fill, lifecycle solvency.
 * `test/KingHook.Invariant.t.sol` — random play: claims back the pool and every credit, the
   manager holds the ETH, the hook and router hold nothing, throne state consistent.
+* `test/KingHook.Revision.t.sol` — partial-fill refunds and sweep prevention, sell-budget isolation,
+  self-retake and relay vesting, all balance-failure observation paths, preserved vested claims,
+  authenticated sell checkpoints and rollback, foreign must-take, refund rejection and rounding.
 * `test/Deploy.t.sol` — the script's `deploy()` on a fresh PoolManager.
 * `test/fork/KingHookFork.t.sol` — launch rehearsal on a **Base mainnet fork** against the live
   PoolManager. It skips (never passes silently) when no RPC is reachable, so the offline verifier
   reports it as skipped; with network access it runs and passed on 2026-10-06.
 
-The floor suite in `.imd/reads/protected` was also run against the hook's and token's creation
-code (10/10 pass). Slither (installed locally) reports only `block.timestamp` comparisons on
-`src/`, all intended: the game is defined in time. Fuzz runs: 256; invariant runs 24 × depth 48.
+The original submission recorded the protected floor suite and Slither results. For this revision,
+see `docs/REVISION.md` for reproduced proofs, regression results and independent agent review.
+Slither is unavailable in this workspace; no fresh Slither result is claimed. The rejected
+callback `transferFrom(user, ...)` pattern was not reintroduced: both pulls still use `msg.sender`
+in the public sell entry points. Fuzz runs: 256; invariant runs 24 × depth 48.
 
 ## Assumptions and limitations
 

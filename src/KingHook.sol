@@ -33,9 +33,9 @@ import {HookFlags} from "./HookFlags.sol";
 /// amount (fee included) is at least the current throne price makes the buyer the king. The price
 /// then becomes 1.2x what the king paid and halves every hour down to a floor of 0.01 ETH. While a
 /// king sits, the throne pool pays him 2% of itself per hour, credited every second; the income of
-/// the first five minutes vests only if the reign lasts that long or ends by somebody else's
-/// takeover. The king must keep the KING tokens his takeover bought: a sell through the router, or
-/// any swap or `dethrone()` call that finds his balance below that amount, empties the throne.
+/// the first five minutes vests only if the reign lasts that long. The king must keep the KING
+/// tokens his takeover bought: a sell through the router, or any swap, claim or `dethrone()` call
+/// that finds his balance below that amount, empties the throne without crediting an unverified gap.
 ///
 /// Fees are held as ERC-6909 claims on the PoolManager, so a swap never needs the PoolManager to hold
 /// ETH up front; payouts burn claims and take ETH inside a PoolManager unlock the hook initiates.
@@ -72,8 +72,8 @@ contract KingHook is IKingHook, IHooks, IUnlockCallback, ReentrancyGuardTransien
     /// @notice Share of the throne pool paid to the king per hour, in basis points (2%).
     uint256 public constant INCOME_BPS_PER_HOUR = 200;
     /// @notice Income earned in the first minutes of a reign is only kept if the reign lasts this
-    /// long or ends through somebody else's takeover. A king who sells or lets his balance drop
-    /// before that forfeits it to the pool: the defence against take-and-dump bots.
+    /// long. Every earlier exit forfeits it to the pool, including self-retakes and rival takeovers:
+    /// the defence against take-and-dump bots and cooperating wallets.
     uint256 public constant INCOME_VESTING = 5 minutes;
     /// @dev `log2(1 / 0.98) * 1e12`: the pool keeps 98% of itself per hour, i.e. decays by
     /// `2^(-elapsed * INCOME_LOG2_PER_HOUR / INCOME_DEN)`.
@@ -200,8 +200,8 @@ contract KingHook is IKingHook, IHooks, IUnlockCallback, ReentrancyGuardTransien
         if (_reentrancyGuardEntered()) revert PayoutInProgress();
         if (PoolId.unwrap(key.toId()) != PoolId.unwrap(_poolId)) revert WrongPool();
 
-        _accrue();
         _enforceHolding();
+        _accrue();
 
         bool ethSpecified = params.zeroForOne == (params.amountSpecified < 0);
         if (!ethSpecified) {
@@ -351,12 +351,29 @@ contract KingHook is IKingHook, IHooks, IUnlockCallback, ReentrancyGuardTransien
     // Public game actions
     // ------------------------------------------------------------------------------------------
 
+    /// @notice Authenticated router checkpoint before a sell escrows the seller's KING.
+    /// @dev Observes the real pre-sell balance, so temporary escrow is never mistaken for a
+    /// transfer out. A previously deficient king cannot rescue unverified income by selling dust.
+    /// The router's nonReentrant swap entry calls this; a failed sell rolls this back atomically.
+    function prepareSell(address seller) external override {
+        if (msg.sender != address(router)) revert NotRouter();
+        if (_reentrancyGuardEntered()) revert PayoutInProgress();
+        _enforceHolding();
+        _accrue();
+        if (king != address(0) && seller == king) _endReign(EndReason.Sold, 0);
+    }
+
     /// @notice Pays the caller everything credited to them: king income (current or past) or the
-    /// team wallet's share. Credits are zeroed before any value moves.
+    /// team wallet's share. Credits are zeroed before any value moves. A claim that observes and
+    /// dethrones a deficient king succeeds even with zero payout, preserving the holding check.
     function claim() external nonReentrant {
+        bool dethroned = _enforceHolding();
         _accrue();
         uint256 amount = pendingIncome[msg.sender];
-        if (amount < 1) revert NothingToClaim();
+        if (amount < 1) {
+            if (dethroned) return;
+            revert NothingToClaim();
+        }
         pendingIncome[msg.sender] = 0;
         emit Claimed(msg.sender, amount);
         _payout(msg.sender, amount);
@@ -364,13 +381,13 @@ contract KingHook is IKingHook, IHooks, IUnlockCallback, ReentrancyGuardTransien
 
     /// @notice Empties the throne when the king no longer holds the KING his takeover bought, for
     /// example after a transfer to another wallet. Anyone may call it. The king's income stops at
-    /// this moment; what he earned until now stays claimable.
+    /// this moment. Vested credits stay claimable; provisional income and the unverified interval
+    /// since `lastAccrual` are forfeited because a plain ERC-20 cannot report when the balance fell.
     function dethrone() external nonReentrant {
-        _accrue();
         if (king == address(0)) revert ThroneEmpty();
         uint256 balance = token.balanceOf(king);
         if (balance >= requiredBalance) revert KingHoldsEnough(balance, requiredBalance);
-        _endReign(EndReason.Balance);
+        _endReign(EndReason.Balance, pool - _remainingPool());
     }
 
     /// @notice PoolManager callback for payouts: burns the hook's ETH claims and sends the ETH.
@@ -435,14 +452,15 @@ contract KingHook is IKingHook, IHooks, IUnlockCallback, ReentrancyGuardTransien
     }
 
     /// @inheritdoc IKingHook
-    /// @dev The pool after the income accrued up to now, which `_accrue` has not necessarily booked.
+    /// @dev Projects unbooked income or, for a deficient king, the return of provisional income.
     function poolSize() public view returns (uint256) {
+        if (_holdingShort()) return pool + provisionalIncome;
         return _remainingPool();
     }
 
     /// @inheritdoc IKingHook
     function incomePerHour() public view returns (uint256) {
-        return (_remainingPool() * INCOME_BPS_PER_HOUR) / BPS;
+        return (poolSize() * INCOME_BPS_PER_HOUR) / BPS;
     }
 
     /// @inheritdoc IKingHook
@@ -458,6 +476,7 @@ contract KingHook is IKingHook, IHooks, IUnlockCallback, ReentrancyGuardTransien
     /// @dev Gross income of the current reign: claimed, claimable, and still vesting.
     function kingReignEarnings() public view returns (uint256) {
         if (king == address(0)) return 0;
+        if (_holdingShort()) return _reigns[_reigns.length - 1].earned - provisionalIncome;
         return _reigns[_reigns.length - 1].earned + (pool - _remainingPool());
     }
 
@@ -535,10 +554,19 @@ contract KingHook is IKingHook, IHooks, IUnlockCallback, ReentrancyGuardTransien
     }
 
     /// @dev The throne game on a buy. Only swaps routed through the hook's own router carry a buyer
-    /// identity the hook can trust; every other router's hookData is ignored, so such buys pay the
-    /// fee but cannot take the throne.
+    /// identity the hook can trust. A foreign router cannot crown anyone; canonical mustTake data
+    /// still reverts so an integrator cannot accidentally pay for a throne it cannot obtain.
     function _onBuy(address sender, bytes calldata hookData, uint256 ethGross, uint256 kingOut) internal {
-        if (sender != address(router) || hookData.length < 64) return;
+        if (hookData.length < 64) return;
+        if (sender != address(router)) {
+            if (hookData.length == 64) {
+                (uint256 buyerWord, uint256 flagWord) = abi.decode(hookData, (uint256, uint256));
+                if (buyerWord <= type(uint160).max && flagWord == 1) {
+                    revert ThroneNotTaken(ethGross, currentThronePrice(), gameOpen());
+                }
+            }
+            return;
+        }
         (address buyer, bool mustTake) = abi.decode(hookData, (address, bool));
         if (buyer == address(0)) return;
 
@@ -548,7 +576,9 @@ contract KingHook is IKingHook, IHooks, IUnlockCallback, ReentrancyGuardTransien
             if (mustTake) revert ThroneNotTaken(ethGross, price, open);
             return;
         }
-        if (king != address(0)) _endReign(EndReason.Dethroned);
+        // Buying again can increase the holding requirement, but cannot shed the previous one.
+        if (buyer == king && requiredBalance > kingOut) kingOut = requiredBalance;
+        if (king != address(0)) _endReign(EndReason.Dethroned, 0);
         _startReign(buyer, ethGross, kingOut, price);
     }
 
@@ -557,14 +587,20 @@ contract KingHook is IKingHook, IHooks, IUnlockCallback, ReentrancyGuardTransien
     function _onSell(address sender, bytes calldata hookData) internal {
         if (sender != address(router) || hookData.length < 64 || king == address(0)) return;
         (address seller,) = abi.decode(hookData, (address, bool));
-        if (seller == king) _endReign(EndReason.Sold);
+        if (seller == king) _endReign(EndReason.Sold, 0);
     }
 
     /// @dev Holding rule, checked on every swap: a king whose balance dropped below the required
     /// amount (a sell through a third-party router, a transfer) loses the throne.
-    function _enforceHolding() internal {
-        if (king == address(0)) return;
-        if (token.balanceOf(king) < requiredBalance) _endReign(EndReason.Balance);
+    function _enforceHolding() internal returns (bool dethroned) {
+        if (_holdingShort()) {
+            _endReign(EndReason.Balance, pool - _remainingPool());
+            return true;
+        }
+    }
+
+    function _holdingShort() internal view returns (bool) {
+        return king != address(0) && token.balanceOf(king) < requiredBalance;
     }
 
     function _startReign(address buyer, uint256 paid, uint256 kingOut, uint256 priceBeaten) internal {
@@ -589,23 +625,22 @@ contract KingHook is IKingHook, IHooks, IUnlockCallback, ReentrancyGuardTransien
         emit ThroneTaken(buyer, _reigns.length - 1, paid, kingOut, priceBeaten);
     }
 
-    /// @dev Must run after `_accrue()` so the ending reign is credited up to now. Income still
-    /// vesting is kept when somebody else took the throne and forfeited to the pool otherwise.
-    function _endReign(EndReason reason) internal {
+    /// @dev Valid sells/takeovers run after accrual. Balance failures must run BEFORE accrual:
+    /// the unverified interval remains in the pool, and all provisional income is returned.
+    /// No early exit can vest income, even a self-retake or a cooperating wallet's takeover.
+    function _endReign(EndReason reason, uint256 forfeited) internal {
         uint256 index = _reigns.length - 1;
         Reign storage reign = _reigns[index];
         uint256 vesting = provisionalIncome;
         if (vesting > 0) {
             provisionalIncome = 0;
-            if (reason == EndReason.Dethroned) {
-                pendingIncome[king] += vesting;
-                emit IncomeVested(king, index, vesting);
-            } else {
-                pool += vesting;
-                reign.earned -= vesting;
-                reign.forfeited = vesting;
-                emit IncomeForfeited(king, index, vesting);
-            }
+            pool += vesting;
+            reign.earned -= vesting;
+            forfeited += vesting;
+        }
+        if (forfeited > 0) {
+            reign.forfeited = forfeited;
+            emit IncomeForfeited(king, index, forfeited);
         }
         reign.end = uint64(block.timestamp);
         reign.reason = reason;
@@ -618,7 +653,7 @@ contract KingHook is IKingHook, IHooks, IUnlockCallback, ReentrancyGuardTransien
     }
 
     /// @dev Pool left after the king's income since `lastAccrual`: 98% per hour, compounded by the
-    /// second. Path-independent, so how often it is booked changes nothing.
+    /// second. Path-independent up to fixed-point rounding.
     function _remainingPool() internal view returns (uint256) {
         if (king == address(0) || block.timestamp <= lastAccrual) return pool;
         uint256 elapsed = block.timestamp - lastAccrual;
@@ -656,6 +691,7 @@ contract KingHook is IKingHook, IHooks, IUnlockCallback, ReentrancyGuardTransien
 
     /// @dev Income of the current reign not yet in `pendingIncome`: vesting plus not yet booked.
     function _reignUnbooked() internal view returns (uint256) {
+        if (_holdingShort()) return 0;
         return provisionalIncome + (pool - _remainingPool());
     }
 

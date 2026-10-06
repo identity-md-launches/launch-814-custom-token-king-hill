@@ -155,7 +155,12 @@ contract KingHookInvariantTest is KingBase {
             assertEq(hook.getReign(hook.reignCount() - 1).end, 0);
             assertEq(hook.getReign(hook.reignCount() - 1).king, hook.king());
         }
-        assertLe(hook.poolSize(), hook.pool());
+        if (hook.king() != address(0) && token.balanceOf(hook.king()) < hook.requiredBalance()) {
+            assertEq(hook.poolSize(), hook.pool() + hook.provisionalIncome(), "projects forfeiture");
+            assertEq(hook.unclaimedIncome(hook.king()), hook.pendingIncome(hook.king()));
+        } else {
+            assertLe(hook.poolSize(), hook.pool());
+        }
     }
 
     function invariant_nobodyIsOwedMoreThanTheClaimsCanPay() public view {

@@ -251,7 +251,7 @@ contract KingHookThroneTest is KingBase {
         assertEq(alice.balance - before, earned);
     }
 
-    function test_beingOutbidWithinFiveMinutesKeepsTheIncome() public {
+    function test_beingOutbidWithinFiveMinutesForfeitsTheIncome() public {
         fundAndOpen();
         buyExactIn(alice, 1 ether, false);
         vm.warp(block.timestamp + 1 minutes);
@@ -259,9 +259,9 @@ contract KingHookThroneTest is KingBase {
         assertGt(earned, 0);
         buyExactIn(bob, 1.2 ether, false);
         assertEq(hook.king(), bob);
-        assertEq(hook.unclaimedIncome(alice), earned, "dethroned by somebody else: income kept");
-        assertEq(hook.getReign(0).earned, earned);
-        assertEq(hook.getReign(0).forfeited, 0);
+        assertEq(hook.unclaimedIncome(alice), 0, "every short reign forfeits, including rival takeovers");
+        assertEq(hook.getReign(0).earned, 0);
+        assertEq(hook.getReign(0).forfeited, earned);
         assertEq(hook.provisionalIncome(), 0, "the new reign starts with nothing vesting");
     }
 

@@ -9,13 +9,15 @@ pragma solidity 0.8.26;
 /// applied with 64 binary digits: `2^(-f)` for `f` in `[0, 1)` is the product of the constants
 /// `2^(-1/2^k)` for every set bit `k` of `f`, each stored as a Q64 fixed-point number (`x * 2^64`).
 /// Every multiplication is followed by a shift, so the only division is the one producing the
-/// fractional exponent. Rounding is always downward and the accumulated error is below 64 wei.
+/// fractional exponent. Constants and shifts round values down; exponent truncation can round the
+/// result up. A conservative absolute error bound is `128 * value / 2^64 + 65` smallest units per
+/// call, not a fixed wei bound. Rounding the remaining pool down increases the king's income.
 library Halving {
     /// @dev `den` must be non-zero and below 2^192 (every caller passes a constant); `value` must be
     /// below 2^192 so that `value * constant` cannot overflow. ETH amounts are far below that bound.
     error HalvingOverflow();
 
-    /// @notice Returns `value * 2^(-num/den)` rounded down.
+    /// @notice Approximates `value * 2^(-num/den)` using Q64 constants and truncated shifts.
     /// @param value The amount to decay.
     /// @param num Exponent numerator (elapsed time scaled by the decay rate).
     /// @param den Exponent denominator (the half-life in the same units).

@@ -21,8 +21,8 @@ import {IKingHook} from "./interfaces/IKingHook.sol";
 /// `msg.sender`. The user therefore is the wallet that holds the tokens, which is what the holding
 /// rule needs. Tokens for a sell are pulled from `msg.sender` before the PoolManager is unlocked and
 /// settled from the router's own balance; ETH for a buy is `msg.value`, settled in full and the
-/// unused part taken back to the user by the PoolManager. The router has no owner and holds nothing
-/// between calls.
+/// unused part taken back to the user by the PoolManager. The router has no owner and retains no
+/// funds from completed orders. Unsolicited token deposits cannot be swept by later callers.
 contract KingRouter is IUnlockCallback, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
     using CurrencyLibrary for Currency;
@@ -89,7 +89,7 @@ contract KingRouter is IUnlockCallback, ReentrancyGuardTransient {
         emit Swapped(msg.sender, true, ethIn, uint256(uint128(delta.amount1())));
     }
 
-    /// @notice Sells exactly `kingIn` KING for ETH (fee already deducted from the amount received).
+    /// @notice Sells up to `kingIn` KING for ETH, refunding unconsumed input on a partial fill.
     function sellExactIn(uint256 kingIn, uint256 minEthOut, uint256 deadline)
         external
         nonReentrant
@@ -97,11 +97,15 @@ contract KingRouter is IUnlockCallback, ReentrancyGuardTransient {
         returns (uint256 ethOut)
     {
         if (kingIn < 1) revert ZeroAmount();
+        hook.prepareSell(msg.sender);
         token.safeTransferFrom(msg.sender, address(this), kingIn);
         BalanceDelta delta = _swap(Order(msg.sender, false, -int256(kingIn), false));
         ethOut = uint256(uint128(delta.amount0()));
         if (ethOut < minEthOut) revert TooLittleReceived(ethOut, minEthOut);
-        emit Swapped(msg.sender, false, ethOut, kingIn);
+        uint256 consumed = uint256(uint128(-delta.amount1()));
+        if (consumed > kingIn) revert TooMuchRequested(consumed, kingIn);
+        if (kingIn > consumed) token.safeTransfer(msg.sender, kingIn - consumed);
+        emit Swapped(msg.sender, false, ethOut, consumed);
     }
 
     /// @notice Sells KING for exactly `ethOut` ETH (net of fee), spending at most `maxKingIn`.
@@ -112,11 +116,13 @@ contract KingRouter is IUnlockCallback, ReentrancyGuardTransient {
         returns (uint256 kingIn)
     {
         if (ethOut < 1 || maxKingIn < 1) revert ZeroAmount();
+        hook.prepareSell(msg.sender);
         token.safeTransferFrom(msg.sender, address(this), maxKingIn);
         BalanceDelta delta = _swap(Order(msg.sender, false, int256(ethOut), false));
         kingIn = uint256(uint128(-delta.amount1()));
+        if (kingIn > maxKingIn) revert TooMuchRequested(kingIn, maxKingIn);
         emit Swapped(msg.sender, false, ethOut, kingIn);
-        uint256 leftover = token.balanceOf(address(this));
+        uint256 leftover = maxKingIn - kingIn;
         if (leftover > 0) token.safeTransfer(msg.sender, leftover);
     }
 
