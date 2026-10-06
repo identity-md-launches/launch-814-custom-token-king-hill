@@ -1,0 +1,27 @@
+{
+  "kind": "univ4_hook",
+  "hook": {
+    "contract": "KingHook",
+    "constructorArgs": ["$poolManager", "$token"],
+    "permissions": [
+      "beforeInitialize",
+      "beforeSwap",
+      "afterSwap",
+      "beforeSwapReturnDelta",
+      "afterSwapReturnDelta"
+    ]
+  },
+  "token": {
+    "contract": "KingToken",
+    "name": "KING",
+    "symbol": "KING",
+    "decimals": 18
+  },
+  "pool": {
+    "pairedCurrency": "0x0000000000000000000000000000000000000000",
+    "fee": 3000,
+    "tickSpacing": 60,
+    "initialPrice": "792281625142643375935439503360000"
+  },
+  "notes": "KING/ETH pool with a King of the Hill throne game run entirely by the hook. Every buy and sell pays a fee in ETH on the settled ETH delta (exact-input and exact-output): 25% at pool initialization decaying linearly to 2.5% over 30 minutes, split 92% to the throne pool and 8% to the team wallet 0x39E3414e7a43DE41675e9bEC52F7C9F6ae489CB6, both pull-based through claim(). Fees are held as ERC-6909 ETH claims on the PoolManager, so no swap depends on the manager holding ETH. When the 30 minutes end the throne opens: a single buy through the hook-owned KingRouter whose ETH amount (fee included) is at least the throne price makes the buyer king; the price becomes 1.2x what he paid, halves every hour down to a 0.01 ETH floor, and is the floor while the throne is empty. The king earns 2% of the throne pool per hour, credited per second and claimable any time, also after losing the throne. He must keep the KING his takeover bought: a sell through KingRouter, or any swap or permissionless dethrone() call that finds his balance below that amount, empties the throne. A must-take flag in hookData reverts a buy that would not take the throne. Only hookData from KingRouter is trusted to name the buyer; other routers' swaps pay the fee but cannot take the throne. No owner, no parameters, not upgradeable, not pausable; the hook never acts on transfers or liquidity changes. Launch: pool initialized at sqrtPriceX96 for 1e8 KING per ETH (10 ETH market cap), 90% of supply as single-sided KING liquidity below the current tick, 0% to the requester."
+}
