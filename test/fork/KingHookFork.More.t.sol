@@ -90,8 +90,16 @@ contract KingHookForkMoreTest is KingHookForkTest {
         vm.expectRevert(abi.encodeWithSelector(IKingHook.KingHoldsEnough.selector, required, required));
         hook.dethrone();
         vm.warp(block.timestamp + 30 minutes);
-        uint256 owed = hook.unclaimedIncome(bob);
-        assertGt(owed, 0);
+        uint256 projected = hook.unclaimedIncome(bob);
+        assertGt(projected, 0);
+        // Book valid holdings before the transfer; only this verified credit survives.
+        vm.prank(alice);
+        router.buyExactIn{value: 1e12}(0, false, block.timestamp);
+        uint256 owed = hook.pendingIncome(bob);
+        assertEq(owed, projected);
+        vm.warp(block.timestamp + 1 hours);
+        uint256 unverified = hook.unclaimedIncome(bob) - owed;
+        assertGt(unverified, 0);
         vm.prank(bob);
         token.transfer(alice, 1);
         vm.prank(alice);
@@ -101,6 +109,7 @@ contract KingHookForkMoreTest is KingHookForkTest {
         IKingHook.Reign memory r = hook.getReign(0);
         assertEq(uint8(r.reason), uint8(IKingHook.EndReason.Balance));
         assertEq(r.earned, owed);
+        assertEq(r.forfeited, unverified);
 
         // The ex-king claims from the live manager; the price decays for the next king.
         vm.warp(block.timestamp + 2 hours);

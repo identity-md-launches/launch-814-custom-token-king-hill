@@ -15,7 +15,6 @@ import {PoolSwapTest} from "v4-core/src/test/PoolSwapTest.sol";
 import {PoolModifyLiquidityTest} from "v4-core/src/test/PoolModifyLiquidityTest.sol";
 import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
-import {SqrtPriceMath} from "v4-core/src/libraries/SqrtPriceMath.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 
 /// @notice Drives the whole system with bounded random play and checks per-operation postconditions
@@ -26,9 +25,7 @@ import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 /// (random hookData), transfer KING to each other and to two outsiders, claim and call `dethrone()`.
 /// A separate whale sells KING that never came out of the pool (the launch's remaining 10%) through
 /// the third-party router, which drains the curve and makes later sells fill partially.
-/// `KingRouter.sellExactIn` keeps the unconsumed part of a partially filled sell (reported in
-/// `.imd-findings.json`, found by this handler before the cap existed), so exact-input router sells
-/// are capped at what the curve can absorb (`routerSellCapacity`) instead of asserting the stranding.
+/// Official exact-input sells include partial fills: unused KING must return to the seller.
 contract KingPlayHandler is Test {
     KingHook immutable hook;
     KingRouter immutable router;
@@ -138,21 +135,6 @@ contract KingPlayHandler is Test {
         return sqrtPriceX96 >= TickMath.MAX_SQRT_PRICE - 1;
     }
 
-    /// @dev The most KING an exact-input sell can hand the curve before the price leaves the launch
-    /// position's range (upper tick 184200), net of the 0.3% LP fee and with a margin. Beyond it a
-    /// sell fills partially, and `KingRouter.sellExactIn` then keeps the unconsumed part: that is the
-    /// defect reported in `.imd-findings.json`, so the handler stays under the cap rather than
-    /// asserting the stranding is fine. Drop this cap once the router refunds the remainder.
-    function routerSellCapacity() internal view returns (uint256) {
-        IPoolManager pm = IPoolManager(address(manager));
-        (uint160 sqrtPriceX96,,,) = StateLibrary.getSlot0(pm, key.toId());
-        uint128 liquidity = StateLibrary.getLiquidity(pm, key.toId());
-        uint160 sqrtTop = TickMath.getSqrtPriceAtTick(184200);
-        if (sqrtPriceX96 >= sqrtTop || liquidity == 0) return 0;
-        uint256 absorbable = SqrtPriceMath.getAmount1Delta(sqrtPriceX96, sqrtTop, liquidity, false);
-        return (absorbable * 990) / 1000;
-    }
-
     /// @dev Checks every swap: the fee is ETH held as a claim, split 92/8, and the hook keeps nothing.
     function checkFee(Snap memory s, uint256 gross, bool exact) internal {
         uint256 feeDelta = manager.balanceOf(address(hook), 0) - s.claims;
@@ -190,7 +172,8 @@ contract KingPlayHandler is Test {
                 check(hook.king() == a, "a buy at or above the price did not take the throne");
                 check(hook.takeoverPaid() == eth, "takeoverPaid is not the fee-inclusive ETH");
                 check(hook.currentThronePrice() == (uint256(eth) * 12) / 10, "price is not 1.2x the payment");
-                check(hook.requiredBalance() == kingOut, "required balance is not the KING delivered");
+                uint256 required = a == s.king && !kingShort(s) && s.required > kingOut ? s.required : kingOut;
+                check(hook.requiredBalance() == required, "takeover holding requirement is incorrect");
                 check(hook.reignStart() == block.timestamp, "reign did not start now");
                 check(hook.reignCount() == s.reigns + 1, "no history entry for the takeover");
             } else {
@@ -230,7 +213,8 @@ contract KingPlayHandler is Test {
                 ghostTakeovers++;
                 check(hook.king() == a, "an exact-output buy at the price did not take the throne");
                 check(hook.takeoverPaid() == ethIn, "takeoverPaid is not pool ETH plus fee");
-                check(hook.requiredBalance() == kingOut, "required balance is not the KING delivered");
+                uint256 required = a == s.king && !kingShort(s) && s.required > kingOut ? s.required : kingOut;
+                check(hook.requiredBalance() == required, "takeover holding requirement is incorrect");
             } else {
                 check(hook.reignCount() == s.reigns, "an exact-output buy below the price opened a reign");
             }
@@ -242,11 +226,9 @@ contract KingPlayHandler is Test {
     function sellIn(uint256 seed, uint256 fraction) external {
         address a = actor(seed);
         uint256 bal = token.balanceOf(a);
-        uint256 cap = routerSellCapacity();
-        if (cap < bal) bal = cap;
         if (bal < 1) return;
         uint256 amount = bound(fraction, 1, bal);
-        bal = token.balanceOf(a);
+        uint256 managerTokens = token.balanceOf(address(manager));
         Snap memory s = snapshot();
         uint256 ethBefore = a.balance;
 
@@ -255,7 +237,9 @@ contract KingPlayHandler is Test {
         try router.sellExactIn(amount, 0, block.timestamp) returns (uint256 ethOut) {
             vm.stopPrank();
             ghostRouterSwaps++;
-            check(token.balanceOf(a) == bal - amount, "exact-input sell did not consume exactly the amount");
+            uint256 consumed = token.balanceOf(address(manager)) - managerTokens;
+            check(consumed <= amount, "exact-input sell exceeded supplied KING");
+            check(token.balanceOf(a) == bal - consumed, "unused exact-input KING was not refunded");
             check(token.balanceOf(address(router)) == 0, "router kept KING after an exact-input sell");
             check(a.balance - ethBefore == ethOut, "seller did not receive the ETH reported");
             uint256 fee = manager.balanceOf(address(hook), 0) - s.claims;
@@ -321,14 +305,16 @@ contract KingPlayHandler is Test {
             hookData
         ) {
             ghostThirdPartySwaps++;
+            check(!mustTake, "foreign must-take buy succeeded");
             uint256 gross = address(manager).balance - s.managerEth;
             checkFee(s, gross, !exactOut);
             check(hook.reignCount() == s.reigns, "a third-party buy opened a reign");
             if (kingShort(s)) check(hook.king() == address(0), "a short king survived a swap");
             else check(hook.king() == s.king, "a third-party buy changed the king");
         } catch {
-            // An exact-output request can exceed the budget once the price has moved; exact input never fails.
-            check(exactOut, "a third-party exact-input buy reverted");
+            // Foreign must-take always refuses; exact-output may also exceed its budget.
+            check(mustTake || exactOut, "a third-party exact-input buy reverted");
+            check(hook.king() == s.king && hook.reignCount() == s.reigns, "reverted buy changed throne");
             check(manager.balanceOf(address(hook), 0) == s.claims, "a reverted third-party buy left a fee");
         }
     }
@@ -430,8 +416,7 @@ contract KingPlayHandler is Test {
         if (s.king == address(0)) {
             check(poolAfter == s.poolSize, "the pool shrank without a king");
         } else {
-            // Two chained decays each round down by at most 64 wei; the hook decays once from the
-            // last booking, so allow for that composition error only.
+            // Composition error is relative to the amount, rather than bounded by 64 wei.
             uint256 floor_ = Halving.decay(s.poolSize, dt * hook.INCOME_LOG2_PER_HOUR(), hook.INCOME_DEN());
             uint256 tolerance = 256 + floor_ / 1e16; // the library's rounding is relative, ~1e-17
             check(poolAfter + tolerance >= floor_, "the king was paid faster than 2% per hour compounded");
@@ -451,16 +436,19 @@ contract KingPlayHandler is Test {
         vm.prank(a);
         try hook.claim() {
             uint256 got = a.balance - before;
-            check(owed > 0, "claim paid with nothing owed");
+            check(owed > 0 || kingShort(s), "zero-credit claim succeeded without dethroning");
             check(got == owed, "claim paid a different amount than unclaimedIncome");
             check(hook.unclaimedIncome(a) == 0, "something stayed claimable after a claim");
             check(s.claims - manager.balanceOf(address(hook), 0) == got, "claims burned differ from ETH paid");
-            check(hook.king() == s.king, "a claim changed the king");
+            check(hook.king() == (kingShort(s) ? address(0) : s.king), "claim failed holding enforcement");
             ghostClaimed += got;
             if (a == team) ghostTeamClaimed += got;
             else ghostActorClaimed += got;
         } catch {
-            check(owed == 0, "a wallet with income could not claim it");
+            check(owed == 0 && !kingShort(s), "claim unexpectedly refused");
+            check(
+                hook.king() == s.king && manager.balanceOf(address(hook), 0) == s.claims, "refused claim changed state"
+            );
         }
     }
 
@@ -477,9 +465,7 @@ contract KingPlayHandler is Test {
             check(hook.requiredBalance() == 0 && hook.currentThronePrice() == 0.01 ether, "throne not reset");
             IKingHook.Reign memory r = hook.getReign(s.reigns - 1);
             check(r.end == block.timestamp && r.reason == IKingHook.EndReason.Balance, "history not closed");
-            bool vested = block.timestamp - r.start >= 5 minutes;
-            if (vested) check(hook.unclaimedIncome(s.king) >= owedBefore, "dethrone reduced vested income");
-            else check(r.earned == 0 && hook.unclaimedIncome(s.king) == owedBefore, "unvested income was kept");
+            check(hook.unclaimedIncome(s.king) == owedBefore, "dethrone changed verified credits");
         } catch {
             check(!kingShort(s), "dethrone refused although the king's balance is short");
             check(hook.king() == s.king, "a refused dethrone changed the king");
@@ -543,6 +529,11 @@ contract KingHookConservationTest is KingBase {
         }
     }
 
+    function holdingShort() internal view returns (bool) {
+        address king = hook.king();
+        return king != address(0) && token.balanceOf(king) < hook.requiredBalance();
+    }
+
     function actorsPending() internal view returns (uint256 owed) {
         for (uint256 i = 0; i < actorList.length; i++) {
             owed += hook.pendingIncome(actorList[i]);
@@ -571,7 +562,11 @@ contract KingHookConservationTest is KingBase {
     function invariant_claimsEqualPoolPlusCredits() public view {
         assertEq(hookClaims(), hook.pool() + hook.provisionalIncome() + owedToEveryone(), "claims != pool + credits");
         assertGe(address(manager).balance, hookClaims(), "manager cannot back the claims");
-        assertLe(hook.poolSize(), hook.pool(), "live pool above the booked pool");
+        if (holdingShort()) {
+            assertEq(hook.poolSize(), hook.pool() + hook.provisionalIncome(), "forfeiture projection");
+        } else {
+            assertLe(hook.poolSize(), hook.pool(), "live pool above the booked pool");
+        }
     }
 
     /// @dev No ETH is created or destroyed anywhere in the system.
@@ -610,13 +605,16 @@ contract KingHookConservationTest is KingBase {
                 assertEq(hook.king(), address(0), "the last reign is closed but there is a king");
             }
             if (r.forfeited > 0) {
-                assertTrue(r.reason == IKingHook.EndReason.Sold || r.reason == IKingHook.EndReason.Balance);
-                assertLt(r.end - r.start, 5 minutes, "vested income was forfeited");
+                if (r.reason != IKingHook.EndReason.Balance) {
+                    assertTrue(r.reason == IKingHook.EndReason.Sold || r.reason == IKingHook.EndReason.Dethroned);
+                    assertLt(r.end - r.start, 5 minutes, "verified vested income was forfeited");
+                }
             }
         }
         assertEq(
             earnedSum,
-            actorsPending() + handler.ghostActorClaimed() + hook.provisionalIncome() + (hook.pool() - hook.poolSize()),
+            actorsPending() + handler.ghostActorClaimed()
+                + (holdingShort() ? 0 : hook.provisionalIncome() + (hook.pool() - hook.poolSize())),
             "reign earnings != credited + paid + accruing"
         );
     }
@@ -641,7 +639,10 @@ contract KingHookConservationTest is KingBase {
             assertGe(hook.currentThronePrice(), 0.01 ether);
             assertLe(hook.currentThronePrice(), (hook.takeoverPaid() * 12) / 10, "price above 1.2x the payment");
             uint256 age = block.timestamp - hook.reignStart();
-            if (age < 5 minutes) {
+            if (holdingShort()) {
+                assertEq(hook.kingVestingIncome(), 0, "deficient king has vesting income");
+                assertEq(hook.unclaimedIncome(king), hook.pendingIncome(king), "unverified income claimable");
+            } else if (age < 5 minutes) {
                 assertEq(hook.kingVestingIncome(), hook.kingReignEarnings(), "reign income claimable before vesting");
                 assertEq(hook.unclaimedIncome(king), hook.pendingIncome(king), "unvested income is claimable");
             } else {
@@ -661,8 +662,7 @@ contract KingHookConservationTest is KingBase {
         }
     }
 
-    /// @dev The two routers and the hook hold nothing between calls (pool-sourced KING only through
-    /// the official router; see the handler's note).
+    /// @dev Both routers refund unused input, including partially filled official sells.
     /// forge-config: default.invariant.runs = 96
     /// forge-config: default.invariant.depth = 64
     /// forge-config: default.invariant.fail-on-revert = false
@@ -673,6 +673,84 @@ contract KingHookConservationTest is KingBase {
         assertEq(token.balanceOf(address(router)), 0);
         assertEq(address(thirdPartyRouter).balance, 0);
         assertEq(token.balanceOf(address(thirdPartyRouter)), 0);
+    }
+
+    function assertPlayAccounting() internal view {
+        invariant_everyPostconditionHeld();
+        invariant_feesAreConserved();
+        invariant_claimsEqualPoolPlusCredits();
+        invariant_ethIsConserved();
+        invariant_reignHistoryIsConsistent();
+        invariant_throneIsConsistent();
+        invariant_nothingIsStranded();
+    }
+
+    // Pin the revision's state transitions so they run even if random play misses a boundary.
+    function test_handlerForeignMustTakeRollsBackBothExactModes() public {
+        handler.tpBuy(0, 1 ether, false, 1, true);
+        handler.tpBuy(0, 1 ether, true, 1, true);
+        assertEq(hookClaims(), 0);
+        assertEq(token.balanceOf(alice), 0);
+        assertPlayAccounting();
+    }
+
+    function test_handlerEarlyRivalTakeoverForfeitsIncome() public {
+        handler.buyIn(2, 10 ether, false);
+        openGame();
+        handler.buyIn(0, 0.01 ether, true);
+        handler.warp(299);
+        uint256 earned = hook.kingReignEarnings();
+        handler.buyIn(1, uint96(hook.currentThronePrice()), true);
+        assertEq(hook.getReign(0).forfeited, earned);
+        assertGt(earned, 0);
+        assertEq(hook.pendingIncome(alice), 0);
+        assertPlayAccounting();
+    }
+
+    function test_handlerShortKingReturnsProvisionalAndClaimDethrones() public {
+        handler.buyIn(2, 10 ether, false);
+        openGame();
+        handler.buyIn(0, 0.01 ether, true);
+        handler.warp(60);
+        handler.buyIn(1, 1e12, false);
+        uint256 provisional = hook.provisionalIncome();
+        assertGt(provisional, 0);
+        handler.transferOut(0, 1, 1, false);
+        handler.warp(6 hours);
+        assertEq(hook.poolSize(), hook.pool() + provisional);
+        assertPlayAccounting();
+        handler.claim(4); // alice, with zero credit: the holding check must still persist
+        assertEq(hook.king(), address(0));
+        assertEq(hook.provisionalIncome(), 0);
+        assertGt(hook.getReign(0).forfeited, provisional);
+        assertPlayAccounting();
+    }
+
+    function test_handlerSelfRetakePreservesLargerRequirement() public {
+        handler.buyIn(2, 10 ether, false);
+        openGame();
+        handler.buyIn(0, 1 ether, true);
+        uint256 required = hook.requiredBalance();
+        handler.warp(7 hours);
+        handler.buyOut(0, 1_000_000 ether, 1);
+        assertEq(hook.king(), alice);
+        assertEq(hook.reignCount(), 2);
+        assertEq(hook.requiredBalance(), required);
+        assertPlayAccounting();
+    }
+
+    function test_handlerOfficialPartialSellRefundsWithoutCapacityCap() public {
+        giveTokens(carol, 99_999_000 ether);
+        openGame();
+        handler.buyIn(0, 1 ether, true);
+        uint256 supplied = token.balanceOf(carol);
+        uint256 managerBefore = token.balanceOf(address(manager));
+        handler.sellIn(2, supplied);
+        uint256 consumed = token.balanceOf(address(manager)) - managerBefore;
+        assertGt(consumed, 0);
+        assertLt(consumed, supplied, "real partial fill");
+        assertEq(token.balanceOf(carol), supplied - consumed);
+        assertPlayAccounting();
     }
 
     /// @dev Drives the same handler through a seeded sequence, then everybody leaves: every credit

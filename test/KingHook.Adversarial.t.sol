@@ -357,15 +357,18 @@ contract KingHookAdversarialTest is KingBase {
     }
 
     /// @dev An ex-king cannot gain by front-running `dethrone()` with `claim()`: the income credited
-    /// is the same either way, and the dethrone still goes through.
+    /// is the same either way, and claim itself empties the throne.
     function test_frontRunningDethroneWithAClaimChangesNothing() public {
         buyExactIn(carol, 10 ether, false);
         openGame();
         uint256 required = buyExactIn(alice, 1 ether, false);
         vm.warp(block.timestamp + 1 hours);
+        uint256 unverified = hook.unclaimedIncome(alice);
+        assertGt(unverified, 0);
         vm.prank(alice);
         token.transfer(bob, required);
         uint256 owed = hook.unclaimedIncome(alice);
+        assertEq(owed, 0, "unverified interval cannot be claimed");
 
         uint256 snap = vm.snapshotState();
         hook.dethrone();
@@ -375,10 +378,12 @@ contract KingHookAdversarialTest is KingBase {
         vm.prank(alice);
         hook.claim();
         assertEq(alice.balance, 1_000 ether - 1 ether + owed);
+        assertEq(hook.king(), address(0), "claim enforces the holding rule itself");
+        vm.expectRevert(IKingHook.ThroneEmpty.selector);
         hook.dethrone();
-        assertEq(hook.king(), address(0));
         assertEq(hook.unclaimedIncome(alice), 0);
         assertEq(viaDethrone, owed, "same credit whichever runs first");
+        assertEq(hook.getReign(0).forfeited, unverified);
     }
 
     /// @dev The swap that evicts a short king still pays its fee, and if it is large enough it takes
